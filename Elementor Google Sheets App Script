@@ -1,0 +1,205 @@
+/**
+ * Elementor to Google Sheets Webhook Integration
+ * ----------------------------------------------
+ * Author: Sohail MN Aka Fingvo
+ * Full Stack Developer
+ * GitHub: https://github.com/sohailmn
+ *
+ * 📌 Description:
+ * This Google Apps Script connects Elementor Pro form submissions to a Google Sheet.
+ * It listens for HTTP POST requests (via Webhook URL) and dynamically maps the submitted
+ * form fields into a designated Google Sheet. Optional email notifications can also be enabled.
+ *
+ * 🧩 Features:
+ * - Dynamic column mapping from form fields
+ * - Optional hidden field-based column ordering and exclusion
+ * - Automatically creates sheets if they don't exist
+ * - Filters out unwanted meta fields like IPs, agents, etc.
+ * - Optional email notifications on submission
+ * - Designed for performance and compatibility with Elementor forms
+ *
+ * 🚀 How to Use:
+ * 1. Open Google Sheets → Extensions → Apps Script
+ * 2. Replace content with this script
+ * 3. Save and deploy as Web App (set access: "Anyone")
+ * 4. Copy the Web App URL
+ * 5. In Elementor form → Add Webhook action → Paste this URL
+ *
+ * Optional Hidden Fields in Elementor Form:
+ * - `e_gs_SheetName`: Sheet name to save to
+ * - `e_gs_order`: Comma-separated field order
+ * - `e_gs_exclude`: Comma-separated fields to exclude
+ */
+
+/////////////////////////
+// Configuration Setup //
+/////////////////////////
+
+let emailNotification = false; // Set to true to enable email notifications
+let emailAddress = "your@email.com"; // Change to your notification email
+
+/////////////////
+// Constants //
+/////////////////
+
+let isNewSheet = false;
+let postedData = {};
+
+const EXCLUDE_PROPERTY = 'e_gs_exclude';
+const ORDER_PROPERTY = 'e_gs_order';
+const SHEET_NAME_PROPERTY = 'e_gs_SheetName';
+
+const ALWAYS_EXCLUDE = [
+  'user_ip', 'user_agent', 'source', 'form_url', 'ua', 'referer',
+  'powered_by', 'Remote IP', 'User Agent', 'form_id', 'form_name', 'Powered by'
+];
+
+///////////////////////////
+// Webhook Endpoints //
+///////////////////////////
+
+// GET Request for testing webhook
+function doGet() {
+  return HtmlService.createHtmlOutput("✅ Webhook URL is active.");
+}
+
+// POST Request for receiving Elementor form data
+function doPost(e) {
+  if (!e || !e.parameter) {
+    Logger.log("❌ ERROR: No data received.");
+    return HtmlService.createHtmlOutput("No data received");
+  }
+
+  try {
+    postedData = flattenObject(e.parameter);
+    insertToSheet(postedData);
+    return HtmlService.createHtmlOutput("✅ Form data received and added to sheet.");
+  } catch (error) {
+    Logger.log("❌ ERROR: " + error.toString());
+    return HtmlService.createHtmlOutput("ERROR: " + error.toString());
+  }
+}
+
+////////////////////////
+// Utility Functions //
+////////////////////////
+
+// Recursively flatten nested objects
+function flattenObject(obj) {
+  const result = {};
+  for (let key in obj) {
+    if (!obj.hasOwnProperty(key)) continue;
+    if (typeof obj[key] === 'object') {
+      const flat = flattenObject(obj[key]);
+      for (let inner in flat) {
+        result[`${key}.${inner}`] = flat[inner];
+      }
+    } else {
+      result[key] = obj[key];
+    }
+  }
+  return result;
+}
+
+// Get or create a sheet by name
+function getFormSheet(sheetName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss.getSheetByName(sheetName)) {
+    ss.insertSheet(sheetName);
+    isNewSheet = true;
+  }
+  return ss.getSheetByName(sheetName);
+}
+
+// Determine final column headers
+function getHeaders(sheet, keys) {
+  let headers = [];
+  if (!isNewSheet) {
+    headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  }
+  const newHeaders = keys.filter(k => !headers.includes(k));
+  headers = [...headers, ...newHeaders];
+  headers = applyColumnOrdering(headers);
+  headers = applyColumnExclusion(headers);
+  headers = headers.filter(h => ![EXCLUDE_PROPERTY, ORDER_PROPERTY, SHEET_NAME_PROPERTY].includes(h));
+  return headers;
+}
+
+// Apply user-defined column order
+function applyColumnOrdering(headers) {
+  if (!postedData[ORDER_PROPERTY]) return headers;
+  const order = stringToArray(postedData[ORDER_PROPERTY]);
+  const ordered = order.filter(h => headers.includes(h));
+  const remaining = headers.filter(h => !ordered.includes(h));
+  return [...ordered, ...remaining];
+}
+
+// Apply field exclusion
+function applyColumnExclusion(headers) {
+  const exclude = new Set(ALWAYS_EXCLUDE);
+  if (postedData[EXCLUDE_PROPERTY]) {
+    stringToArray(postedData[EXCLUDE_PROPERTY]).forEach(h => exclude.add(h));
+  }
+  return headers.filter(h => !exclude.has(h));
+}
+
+// Split comma-separated string into array
+function stringToArray(str) {
+  return str.split(',').map(s => s.trim());
+}
+
+// Map header fields to submitted values
+function getValues(headers, flat) {
+  return headers.map(h => flat[h] || '');
+}
+
+// Insert a row into the sheet
+function insertRowData(sheet, row, values, bold = false) {
+  const range = sheet.getRange(row, 1, 1, values.length);
+  range.setValues([values]);
+  if (bold) range.setFontWeight("bold");
+  range.setHorizontalAlignment("center");
+}
+
+// Set header row
+function setHeaders(sheet, headers) {
+  insertRowData(sheet, 1, headers, true);
+}
+
+// Insert values row
+function setValues(sheet, values) {
+  const lastRow = sheet.getLastRow();
+  sheet.insertRowAfter(lastRow);
+  insertRowData(sheet, lastRow + 1, values);
+}
+
+// Main form insertion logic
+function insertToSheet(data) {
+  const sheetName = data[SHEET_NAME_PROPERTY] || data["form_name"] || "Form Submissions";
+  const flat = flattenObject(data);
+  const keys = Object.keys(flat);
+  const sheet = getFormSheet(sheetName);
+  const headers = getHeaders(sheet, keys);
+  const values = getValues(headers, flat);
+  setHeaders(sheet, headers);
+  setValues(sheet, values);
+
+  if (emailNotification) {
+    sendNotification(data, getSheetURL());
+  }
+}
+
+// Send email notification
+function sendNotification(data, url) {
+  MailApp.sendEmail(
+    emailAddress,
+    `New Elementor submission: ${data['form_name'] || 'No form name'}`,
+    `New data was added to your sheet: ${url}`,
+    { name: 'Elementor Google Sheet Connector' }
+  );
+}
+
+// Get current spreadsheet URL
+function getSheetURL() {
+  return SpreadsheetApp.getActiveSpreadsheet().getUrl();
+}
